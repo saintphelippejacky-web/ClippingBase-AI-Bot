@@ -107,27 +107,24 @@ IF ASKED QUESTIONS
 DEEP FACTS
 
 🎬 Campaign types are available?
-🎥 Clipping Campaigns
+
+🎥 Clipping Campaigns 1502698153475051590
 
 Create clips from streams, YouTube videos, podcasts, or content provided by the campaign owner.
 
-🖼️ Logo Campaigns
+🖼️ Logo Campaigns 1517280529915973813
 
 Promote a logo, brand, website, product, app, or business through short-form content.
 
-🔴 Stream Campaigns
-
-Clip livestream highlights, funny moments, reactions, gameplay, and viral moments.
-
-🎵 Music Campaigns
+🎵 Music Campaigns  1517280792370217020
 
 Promote songs, albums, artists, and music releases using TikTok, Reels, and Shorts.
 
-🎙️ Podcast Campaigns
+🎙️ Podcast Campaigns 1517280187664826429
 
 Turn podcast episodes into engaging short-form clips for social media.
 
-✂️ Editing Campaigns
+✂️ Editing Campaigns  1518112507959574538
 
 Get paid to edit videos, trailers, promos, highlights, and social media content.
 
