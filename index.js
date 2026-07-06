@@ -13,11 +13,14 @@ const {
   Routes,
   SlashCommandBuilder,
   ChannelType,
-  MessageFlags
+  MessageFlags,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  AttachmentBuilder
 } = require('discord.js');
 
 const OpenAI = require('openai');
-
 
 const client = new Client({
   intents: [
@@ -28,9 +31,17 @@ const client = new Client({
 });
 
 // =========================
-// GLOBAL ERROR PROTECTION (VERY IMPORTANT)
+// CONFIG & DATA TRACKING
 // =========================
+let whatsNewText = "Welcome! No new updates just yet. Stay tuned!"; 
+const LOG_CHANNEL_ID = '1523051339045802044';
+let inactivityTimeoutHours = 5; // Configurable inactivity window (Tracked strictly in Hours)
 
+// Staff Role Declarations for Mentions
+const ADMIN_ROLE_ID = '1360755486793666580';
+const MODS_ROLE_ID = '1476806644900827239';
+
+// Global error handling guardrails
 process.on("unhandledRejection", (reason, promise) => {
   console.error("🔥 Unhandled Rejection:", reason);
 });
@@ -43,24 +54,87 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
-// 🧠 memory
+// Conversational and metric states
 let conversations = {};
 const userThreads = {};
-const threadTimeouts = {};
+const threadLastActivity = {}; // Tracks timestamp of the last message sent in a thread: { [threadId]: timestamp }
+
+// Spam Tracking State Storage
+const antiSpamTracker = {}; // Format: { [userId]: { timestamps: [], lastMessage: "", violations: 0 } }
 
 const analytics = {
   activeThreads: 0,
   totalThreads: 0,
   closedThreads: 0,
+  autoClosedThreads: 0, // Tracks chats closed automatically due to inactivity
   solved: 0,
   unsolved: 0,
   messages: 0,
   fallback: 0,
-  errors: 0
+  errors: 0,
+  updateLikes: 0,
+  updateDislikes: 0,
+  spamBlocks: 0, // Tracks occurrences of blocked spam attempts
+  featureRequests: [], // Formatted: { id: string, userId: string, userTag: string, text: string, timestamp: string, reviewed: boolean }
+  
+  // Track metrics for micro-scale friction points
+  categories: {
+    "Payout Issue": 0,
+    "Sign-Up Bug": 0,
+    "Campaign Inquiry": 0,
+    "General Question": 0,
+    "Unclassified/Error": 0
+  }
 };
 
+// Helper pagination generator for Feature Request flows
+function createFeatureEmbedAndRow(requestsList, currentIndex, flowType) {
+  const target = requestsList[currentIndex];
+  const serverIcon = client.user.displayAvatarURL();
+
+  const embed = new EmbedBuilder()
+    .setColor(0x32CD32)
+    .setTitle(flowType === 'pending' ? "⏳ Pending Feature Request" : "💡 Feature Request Detail")
+    .setDescription(
+      `**Request | By:** <@${target.userId}> (@${target.userTag})\n\n` +
+      `"${target.text}"\n\n` +
+      `*Item \`${currentIndex + 1}\` of \`${requestsList.length}\` items in this view*`
+    )
+    .setFooter({ text: `${target.timestamp} • Status: ${target.reviewed ? "✅ Reviewed" : "⏳ Pending"}`, iconURL: serverIcon });
+
+  const row = new ActionRowBuilder();
+
+  // 1. Structural Pagination Management Buttons
+  if (requestsList.length > 1) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`feat_nav_${flowType}_prev_${currentIndex}`)
+        .setLabel("◀ Previous")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(currentIndex === 0),
+      new ButtonBuilder()
+        .setCustomId(`feat_nav_${flowType}_next_${currentIndex}`)
+        .setLabel("Next ▶")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(currentIndex === requestsList.length - 1)
+    );
+  }
+
+  // 2. Performance action toggle button
+  if (!target.reviewed) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`review_mark_${target.id}_${flowType}_${currentIndex}`)
+        .setLabel("Mark as Reviewed ✅")
+        .setStyle(ButtonStyle.Success)
+    );
+  }
+
+  return { embeds: [embed], components: row.components.length > 0 ? [row] : [] };
+}
+
 // =========================
-// 🧠 SYSTEM PROMPT (LOCKED LOGIN FORMAT)
+// 🧠 SYSTEM PROMPT
 // =========================
 const SYSTEM_PROMPT = `
 You are ClippingBase AI — the official assistant for ClippingBase
@@ -105,8 +179,7 @@ MODS AND ADMINS ROLE
 Admin role - 1360755486793666580
 Mods - 1476806644900827239
 - Always refer users to these roles when they ask for help or have issues that require staff attention and mention the roles when discussing about them dont just use the numbers.
-- For example, if a user has a payout issue that you cannot resolve, you would say: "For payout issues, please contact our 
-support team by mentioning the Admin role <@&1360755486793666580> or the Mods role <@&1476806644900827239> in the #support channel <#1455662844149366804>."
+- For example, if a user has a payout issue that you cannot resolve, you would say: "For payout issues, please contact our support team by mentioning the Admin role <@&1360755486793666580> or the Mods role <@&1476806644900827239> in the #support channel <#1455662844149366804>."
 ━━━━━━━━━━━━━━━━━━━
 📋 LOGIN & SIGN UP TEMPLATES
 
@@ -190,8 +263,7 @@ ONLY USE THIS DATA.
 ∘ intro info, and getting started guidance
 
 ● Verify Channel → <#1482181680092680383>
-∘ Used to verify yourself as a real user and not a bot verify simply by clikcing the ✅Verify button in that channel upon clikcking 
-the button you will be granted the Clipper role 1360418625307152414 which will give you access to the rest of the server channels and features
+∘ Used to verify yourself as a real user and not a bot verify simply by clikcing the ✅Verify button in that channel upon clikcking the button you will be granted the Clipper role 1360418625307152414 which will give you access to the rest of the server channels and features
 ∘ Required before accessing full server features and categories and channels always mentions the roles when talking about them.
 ∘ Unlocks main channels after completion
 
@@ -261,8 +333,7 @@ the button you will be granted the Clipper role 1360418625307152414 which will g
 ∘ Account, payout, and general support tickets or any other issues
 
 ● AI Support → <#1511543190803447858>
-∘ Automated AI assistance channel for quick help, this is where you are right now! Users can ask questions and get instant AI-generated responses based on the ClippingBase Master System Map. This is ideal for common questions, navigation help, and general guidance without
- needing to wait for staff response. Users click the "Start Chat" button in this channel to create a private thread with ClippingBase AI for personalized assistance.
+∘ Automated AI assistance channel for quick help, this is where you are right now! Users can ask questions and get instant AI-generated responses based on the ClippingBase Master System Map. This is ideal for common questions, navigation help, and general guidance without needing to wait for staff response. Users click the "Start Chat" button in this channel to create a private thread with ClippingBase AI for personalized assistance.
 ∘ Quick answers and troubleshooting help
 
 ━━━━━━━━━━━━━━━━━━━
@@ -280,236 +351,233 @@ the button you will be granted the Clipper role 1360418625307152414 which will g
 
 ━━━━━━━━━━━━━━━━━━━
 🧠 CLIPPINGBASE MASTER SYSTEM MAP
-
-The CLIPPINGBASE MASTER SYSTEM MAP is the source of truth for all navigation questions. Do not tells users  based on the ClippingBase Master System Map. when telling locations. Those AI responses are generated by you.
-
-LANDING PAGE
-https://clippingbase.com
-
-Top Bar:
-● Left: ClippingBase logo
-● Right: Hamburger menu
-
-Landing Page Menu:
-● Contact Page
-● I'm a Creator
-
-CREATOR PAGE
-https://clippingbase.com/creator
-
-Creator Page Menu:
-● Contact
-● Login
-
-LOGIN POPUP
-
-Title:
-● Welcome, back
-
-Options:
-● Continue with Discord
-● Continue with Email
-● Continue with Google (Coming Soon)
-
-Client Section:
-● Are you a Client?
-● Sign In as a Client (Coming Soon)
-
-DESKTOP NAVIGATION
-
-Top Navigation:
-● Home
-● Campaigns
-● Leaderboard
-● Socials
-● Earnings
-● My Campaigns
-
-Right Side:
-● Theme Toggle
-● Notifications
-● Profile Avatar
-
-Profile Popup:
-● Avatar
-● Username
-● Email
-● Settings
-● Support
-● Report Bug
-● Logout
-
-MOBILE NAVIGATION
-
-Bottom Navigation:
-● Dashboard
-● Earnings
-● Campaigns
-● Socials
-● More
-
-More Menu:
-● My Campaigns
-● Leaderboard
-● Settings
-● Support
-
-Mobile Top Bar:
-● Left: ClippingBase Logo
-● Right: Notifications and Profile Avatar
-
-Mobile Profile Popup:
-● Avatar
-● Username
-● Email
-● Theme Toggle
-● Settings
-● Support
-● Logout
-
-LEADERBOARD
-
-Desktop:
-● Top Navigation → Leaderboard
-
-Mobile:
-● More → Leaderboard
-
-SUPPORT
-
-Email:
-● hello@clippingbase.com
-
-Bug Reports:
-● Profile Avatar → Report Bug
-
-Users can:
-● Submit text reports
-● Upload screenshots/images
-● Describe issues
-
-RULES:
-● NEVER guess UI locations
-● ALWAYS use this map
-● NEVER tell users to look around
-● ALWAYS provide exact navigation paths
-
-━━━━━━━━━━━━━━━━━━━
-📌 RULE
-Always guide users step-by-step using real UI only.
+[...]
 `;
 
 // =========================
-// INTENT DETECTOR
+// APPLICATION STARTUP & COMMAND REGISTRATION
 // =========================
-function detectIntent(text) {
-  const t = text.toLowerCase();
+client.once('ready', async () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
+  
+  client.user.setPresence({
+    activities: [{ name: "ClippingBase.com", type: 3 }],
+    status: "online"
+  });
 
-  if (/\b(sign up|signup|join|new here|start)\b/.test(t)) return "signup";
-  if (/\b(login|log in|sign in|create account|register)\b/.test(t)) return "login";
-  if (/\b(earnings|withdraw|payout|money)\b/.test(t)) return "earnings";
-  if (/\b(campaign|campaigns|tasks)\b/.test(t)) return "campaigns";
+  const commands = [
+    new SlashCommandBuilder()
+      .setName('panel')
+      .setDescription('Send a custom ClippingBase AI panel')
+      .addStringOption(option => option.setName('title').setDescription('Embed title').setRequired(true))
+      .addStringOption(option => option.setName('description').setDescription('Embed description').setRequired(true))
+      .addStringOption(option => option.setName('image').setDescription('Image URL').setRequired(false))
+      .addStringOption(option => option.setName('color').setDescription('Hex color').setRequired(false)),
 
-  return "default";
-}
+    new SlashCommandBuilder()
+      .setName('analytics')
+      .setDescription('Show ClippingBase AI performance dashboard')
+  ].map(cmd => cmd.toJSON());
 
-// =========================
-// BUTTONS
-// =========================
-function getButtons(intent) {
-
-  if (intent === "signup") {
-    return [
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setLabel("Creator Sign Up")
-          .setStyle(ButtonStyle.Link)
-          .setURL("https://clippingbase.com/creator")
-      )
-    ];
-  }
-
-  if (intent === "login") {
-    return [
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setLabel("Creator Sign In")
-          .setStyle(ButtonStyle.Link)
-          .setURL("https://clippingbase.com/creator")
-      )
-    ];
-  }
-
-  return [];
-}
-
-// =========================
-// BOT
-// =========================
-client.on('messageCreate', async (message) => {
+  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 
   try {
+    await rest.put(
+      Routes.applicationCommands(client.user.id),
+      { body: commands }
+    );
+    console.log("✅ Slash commands synchronized successfully.");
+  } catch (err) {
+    console.error("❌ Error registering slash commands:", err);
+  }
 
+  // =============================================
+  // 🕒 AUTOMATIC INACTIVITY ENGINE (HOURS CALCULATION)
+  // =============================================
+  setInterval(async () => {
+    const NOW = Date.now();
+    const TIMEOUT_MS = inactivityTimeoutHours * 60 * 60 * 1000;
+
+    for (const [uid, threadId] of Object.entries(userThreads)) {
+      const lastActive = threadLastActivity[threadId] || NOW; 
+      
+      if (NOW - lastActive >= TIMEOUT_MS) {
+        try {
+          const threadChannel = await client.channels.fetch(threadId).catch(() => null);
+          
+          if (threadChannel) {
+            analytics.activeThreads = Math.max(0, analytics.activeThreads - 1);
+            analytics.closedThreads++;
+            analytics.autoClosedThreads++; 
+            analytics.unsolved++; 
+
+            try {
+              const logChannel = await client.channels.fetch(LOG_CHANNEL_ID);
+              if (logChannel) {
+                let userFetch = await client.users.fetch(uid).catch(() => null);
+                let userTagString = userFetch ? `@${userFetch.tag}` : "Unknown User";
+
+                const timeoutLogEmbed = new EmbedBuilder()
+                  .setColor('#FF8C00') 
+                  .setTitle('🍂 Private Chat Auto-Closed')
+                  .addFields(
+                    { name: 'User Info', value: `<@${uid}> (${userTagString})`, inline: true },
+                    { name: 'Status', value: `❌ Unsolved (Timed out due to ${inactivityTimeoutHours}h Inactivity)`, inline: true }
+                  )
+                  .setFooter({ text: "ClippingBase AI Automation Sweep", iconURL: client.user.displayAvatarURL() })
+                  .setTimestamp();
+
+                await logChannel.send({ embeds: [timeoutLogEmbed] });
+              }
+            } catch (logErr) {
+              console.error("Failed handling automated timeout channel log distribution:", logErr);
+            }
+
+            await threadChannel.delete().catch(() => {});
+          }
+        } catch (err) {
+          console.error(`Error processing inactivity sweep on thread ID ${threadId}:`, err);
+        }
+
+        delete conversations[uid];
+        delete userThreads[uid];
+        delete threadLastActivity[threadId];
+        if (antiSpamTracker[uid]) delete antiSpamTracker[uid]; // Clean memory up safely
+      }
+    }
+  }, 5000); 
+});
+
+// =========================
+// MAIN TEXT CHAT MESSAGE ROUTER
+// =========================
+client.on('messageCreate', async (message) => {
+  try {
     if (message.author.bot) return;
 
     const userId = message.author.id;
-    analytics.messages++;
+    const isBotTrackedThread = message.channel.isThread() && Object.values(userThreads).includes(message.channel.id);
 
+    if (isBotTrackedThread) {
+      threadLastActivity[message.channel.id] = Date.now();
+
+      // 🛑 AUTOMATED ANTI-SPAM GUARDRAILS SYSTEM ENGINE
+      if (!antiSpamTracker[userId]) {
+        antiSpamTracker[userId] = { timestamps: [], lastMessage: "", violations: 0 };
+      }
+
+      const userSpamState = antiSpamTracker[userId];
+      const nowTimestamp = Date.now();
+
+      // Clean old entries older than 5 seconds out of sliding window tracker
+      userSpamState.timestamps = userSpamState.timestamps.filter(time => nowTimestamp - time < 5000);
+      userSpamState.timestamps.push(nowTimestamp);
+
+      // Evaluate Pattern A: Rapid flooding limits (e.g., 3 messages within 5 seconds window)
+      const isRateFlooding = userSpamState.timestamps.length > 3;
+      // Evaluate Pattern B: Exact repeated continuous text blocks duplication checks
+      const isDuplicateSpam = userSpamState.lastMessage === message.content.trim() && message.content.trim().length > 4;
+
+      userSpamState.lastMessage = message.content.trim();
+
+      if (isRateFlooding || isDuplicateSpam) {
+        analytics.spamBlocks++;
+        userSpamState.violations++;
+
+        // Only send an emergency dispatch log once every 3 structural burst messages to prevent logging channel overload
+        if (userSpamState.violations % 2 === 1) {
+          try {
+            const logChannel = await client.channels.fetch(LOG_CHANNEL_ID);
+            if (logChannel) {
+              const staffAlertEmbed = new EmbedBuilder()
+                .setColor('#FF0000')
+                .setTitle('🚨 AI Support Chat Spam Detected')
+                .setDescription(
+                  `**User:** <@${userId}> (@${message.author.tag})\n` +
+                  `**Location:** <#${message.channel.id}>\n` +
+                  `**Trigger Reason:** ${isRateFlooding ? 'Excessive rate rate limit sending speed' : 'Identical message repetition flood'}\n\n` +
+                  `**Flagged Content Sent:**\n\`\`\`${message.content.slice(0, 500)}\`\`\``
+                )
+                .setFooter({ text: "ClippingBase Anti-Spam Security Monitor" })
+                .setTimestamp();
+
+              // Mentions the live roles for immediate alert responses
+              await logChannel.send({
+                content: `⚠️ **Attention Staff!** <@&${ADMIN_ROLE_ID}> <@&${MODS_ROLE_ID}> — Potential thread exploit spam isolated below:`,
+                embeds: [staffAlertEmbed]
+              });
+            }
+          } catch (err) {
+            console.error("Failed executing automated anti-spam dashboard logging pipelines:", err);
+          }
+        }
+
+        // Ephemerally soft warn user by replying and then immediately dropping out to block execution flow processing to OpenAI API hooks
+        return message.reply("⚠️ **Slow down!** You're sending messages too quickly. Please stay focused on your topic so the AI can assist properly.").then(warnMsg => {
+          setTimeout(() => warnMsg.delete().catch(() => {}), 6000);
+        });
+      }
+    }
+
+    if (message.content.toLowerCase().includes('--new')) {
+      if (!message.member.permissions.has('Administrator')) {
+        return message.reply("❌ Only admins can update the changelog.");
+      }
+
+      let cleanContent = message.content.replace(/--new/gi, '').trim();
+
+      if (cleanContent) {
+        whatsNewText = cleanContent;
+        
+        const confirmationEmbed = new EmbedBuilder()
+          .setColor(0x32CD32)
+          .setTitle("✅ Updates Saved Natively!")
+          .setDescription(`**New Panel Preview (Self-destructing in 10s):**\n\n${whatsNewText}`)
+          .setTimestamp();
+
+        const previewMsg = await message.reply({ embeds: [confirmationEmbed] });
+        await message.delete().catch(() => {});
+
+        setTimeout(() => {
+          previewMsg.delete().catch(() => {});
+        }, 10000);
+        return;
+      }
+    }
+
+    analytics.messages++;
     const userInput = message.content.replace(/<@!?\d+>/g, '').trim();
 
-
-// ==========================================
-// 🏷️ AI-POWERED SMART THREAD RENAMING (GPT-4o-Mini)
-// ==========================================
-if (message.channel.isThread() && message.channel.name.toLowerCase() === `${message.author.username}-chat`.toLowerCase()) {
-
-    (async () => {
+    if (message.channel.isThread() && message.channel.name.toLowerCase() === `${message.author.username}-chat`.toLowerCase()) {
+      (async () => {
         try {
-            // Call the OpenAI API using your gpt-4o-mini configuration
-            const response = await openai.chat.completions.create({
-                model: "gpt-4o-mini",
-                messages: [{ 
-                    role: "user", 
-                    content: `Analyze this user's first message and summarize it into a clean, title-cased channel topic that is exactly 2 to 4 words max. Do not include quotes, punctuation, or filler words. Message: "${userInput}"` 
-                }],
-                max_tokens: 12,
-                temperature: 0.4
-            });
+          const response = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [{ 
+              role: "user", 
+              content: `Analyze this user's first message and summarize it into a clean, title-cased channel topic that is exactly 2 to 4 words max. Do not include quotes, punctuation, or filler words. Message: "${userInput}"` 
+            }],
+            max_tokens: 12,
+            temperature: 0.4
+          });
 
-            // Isolate and sanitize the generated string
-            let smartTitle = response.choices[0].message.content.replace(/["'./\\]/g, '').trim();
-            
-            // Format to exact specs: "Username - Summarized Topic"
-            const finalTitle = `${message.author.username} - ${smartTitle}`;
-            
-            // Push the rename update to the Discord thread API channel structure
-            await message.channel.edit({ name: finalTitle });
-            console.log(`🤖 Thread successfully renamed to: ${finalTitle}`);
+          let smartTitle = response.choices[0].message.content.replace(/["'./\\]/g, '').trim();
+          const finalTitle = `${message.author.username} - ${smartTitle}`;
+          
+          await message.channel.edit({ name: finalTitle });
+          console.log(`🤖 Thread successfully renamed to: ${finalTitle}`);
         } catch (err) {
-            console.error("⚠️ Failed to generate smart AI title:", err);
+          console.error("⚠️ Failed to generate smart AI title:", err);
         }
-    })();
-}
+      })();
+    }
 
-
-
-
-    // =========================
-    // EMPTY / MENTION ONLY CASE
-    // =========================
     if (!userInput) {
-
-      const avatarURL = message.author.displayAvatarURL({
-        dynamic: true,
-        size: 1024
-      });
+      const avatarURL = message.author.displayAvatarURL({ dynamic: true, size: 1024 });
 
       const embed = new EmbedBuilder()
         .setColor(0x32CD32)
-        .setAuthor({
-          name: message.author.username,
-          iconURL: avatarURL
-        })
+        .setAuthor({ name: message.author.username, iconURL: avatarURL })
         .setDescription("Yo, what’s up? 😎✌️")
         .setFooter({ text: "ClippingBase AI" })
         .setTimestamp();
@@ -518,106 +586,71 @@ if (message.channel.isThread() && message.channel.name.toLowerCase() === `${mess
     }
 
     const lower = userInput.toLowerCase();
+    const closePhrases = ['close thread', 'close this thread', 'end thread', 'close ticket', 'end ticket'];
 
-// ==========================================
-// 🧵 TEXT-TRIGGERED THREAD CLOSURE DETECTION
-// ==========================================
-const closePhrases = ['close thread', 'close this thread', 'end thread', 'close ticket', 'end ticket'];
+    if (closePhrases.some(phrase => lower.includes(phrase))) {
+      const avatarURL = message.author.displayAvatarURL({ dynamic: true, size: 1024 });
 
-if (closePhrases.some(phrase => lower.includes(phrase))) {
-    const avatarURL = message.author.displayAvatarURL({ dynamic: true, size: 1024 });
-
-    // Check if this message happened outside a thread
-    if (!message.channel.isThread()) {
+      if (!message.channel.isThread()) {
         const errorEmbed = new EmbedBuilder()
-            .setColor(0xFF0000)
-            .setAuthor({ name: message.author.username, iconURL: avatarURL })
-            .setDescription("❌ You can only close threads inside an active thread channel!")
-            .setFooter({ text: "ClippingBase AI" })
-            .setTimestamp();
+          .setColor(0xFF0000)
+          .setAuthor({ name: message.author.username, iconURL: avatarURL })
+          .setDescription("❌ You can only close threads inside an active thread channel!")
+          .setFooter({ text: "ClippingBase AI" })
+          .setTimestamp();
 
         return message.reply({ embeds: [errorEmbed] });
-    }
+      }
 
-    // Directly display your existing confirmation buttons
-    const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setCustomId("confirm_close_yes")
-            .setLabel("Yes, close it")
-            .setStyle(ButtonStyle.Danger),
-        new ButtonBuilder()
-            .setCustomId("confirm_close_no")
-            .setLabel("Cancel")
-            .setStyle(ButtonStyle.Secondary)
-    );
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("confirm_close_yes").setLabel("Yes, close it").setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId("confirm_close_no").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
+      );
 
-    // Create an embed version of your question to preserve your custom avatar styling
-    const questionEmbed = new EmbedBuilder()
-        .setColor(0x32CD32) // Uses your standard green theme
+      const questionEmbed = new EmbedBuilder()
+        .setColor(0x32CD32) 
         .setAuthor({ name: message.author.username, iconURL: avatarURL })
         .setDescription("⚠️ Are you sure you want to close this thread?")
         .setFooter({ text: "ClippingBase AI" })
         .setTimestamp();
 
-    return message.reply({ embeds: [questionEmbed], components: [row] });
-}
+      return message.reply({ embeds: [questionEmbed], components: [row] });
+    }
 
-
-
-// Your existing AI / database logic continues below...
-
-
-    // =========================
-    // MEMORY INIT
-    // =========================
     if (!conversations[userId]) conversations[userId] = [];
-
-    conversations[userId].push({
-      role: "user",
-      content: userInput
-    });
+    conversations[userId].push({ role: "user", content: userInput });
 
     await message.channel.sendTyping();
 
     let response;
-try {
-  response = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [
-      { role: "system", content: SYSTEM_PROMPT },
-      ...conversations[userId]
-    ],
-    max_tokens: 350
-  });
-} catch (apiErr) {
-  console.error("OpenAI Error:", apiErr);
-  return message.reply("AI is having a moment. Try again in a bit.");
-}
-  
+    try {
+      response = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          ...conversations[userId]
+        ],
+        max_tokens: 350
+      });
+    } catch (apiErr) {
+      console.error("OpenAI Error:", apiErr);
+      return message.reply("AI is having a moment. Try again in a bit.");
+    }
 
     let reply = response?.choices?.[0]?.message?.content || "I didn't catch that.";
     reply = reply.replace(/\n{3,}/g, "\n\n");
 
-    conversations[userId].push({
-      role: "assistant",
-      content: reply
-    });
+    conversations[userId].push({ role: "assistant", content: reply });
 
     if (conversations[userId].length > 14) {
       conversations[userId].shift();
     }
 
-    const avatarURL = message.author.displayAvatarURL({
-      dynamic: true,
-      size: 1024
-    });
+    const avatarURL = message.author.displayAvatarURL({ dynamic: true, size: 1024 });
 
     const embed = new EmbedBuilder()
       .setColor(0x32CD32)
-      .setAuthor({
-        name: message.author.username,
-        iconURL: avatarURL
-      })
+      .setAuthor({ name: message.author.username, iconURL: avatarURL })
       .setDescription(reply)
       .setFooter({ text: "ClippingBase AI" })
       .setTimestamp();
@@ -631,288 +664,501 @@ try {
 });
 
 // =========================
-// COMMAND
-const commands = [
-  new SlashCommandBuilder()
-    .setName('panel')
-    .setDescription('Send a custom ClippingBase AI panel')
-    .addStringOption(option =>
-      option.setName('title').setDescription('Embed title').setRequired(true))
-    .addStringOption(option =>
-      option.setName('description').setDescription('Embed description').setRequired(true))
-    .addStringOption(option =>
-      option.setName('image').setDescription('Image URL').setRequired(false))
-    .addStringOption(option =>
-      option.setName('color').setDescription('Hex color').setRequired(false)),
-
-  new SlashCommandBuilder()
-    .setName('analytics')
-    .setDescription('Show ClippingBase AI performance dashboard')
-].map(cmd => cmd.toJSON());
-
-
-// READY EVENT
-client.once('ready', async () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
-  client.user.setPresence({
-  activities: [
-    {
-      name: "ClippingBase.com",
-      type: 3 // WATCHING
-    }
-  ],
-  status: "online"
-});
-
-  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-
-  try {
-    await rest.put(
-      Routes.applicationCommands(client.user.id),
-      { body: commands }
-    );
-
-    console.log("✅ Slash command registered");
-  } catch (err) {
-    console.error(err);
-  }
-});
-
-// =========================
-// INTERACTIONS
+// CORE INTERACTION HANDLING
 // =========================
 client.on('interactionCreate', async (interaction) => {
-    if (interaction.isButton()) {
-        if (interaction.customId === "start_chat") {
-            await interaction.deferReply({ ephemeral: true });
-            const user = interaction.user;
-            const avatarURL = user.displayAvatarURL({ dynamic: true, size: 1024 });
+  
+  if (interaction.isChatInputCommand()) {
+    if (interaction.commandName === "panel") {
+      const title = interaction.options.getString("title");
+      const description = interaction.options.getString("description");
+      const image = interaction.options.getString("image");
+      const colorOption = interaction.options.getString("color");
 
-            // Case 1: User already has an active chat session open
-            if (userThreads[user.id]) {
-                const duplicateEmbed = new EmbedBuilder()
-                    .setColor(0xFF0000) // Red warning border
-                    .setAuthor({ name: user.username, iconURL: avatarURL })
-                    .setDescription("❌ You already have an active chat.")
-                    .setFooter({ text: "ClippingBase AI" })
-                    .setTimestamp();
-
-                return interaction.editReply({ embeds: [duplicateEmbed] });
-            }
-
-            // Create the private thread channel
-            const thread = await interaction.channel.threads.create({ 
-                name: `${user.username}-chat`, 
-                type: ChannelType.PrivateThread, 
-                autoArchiveDuration: 60 
-            });
-            
-            await thread.members.add(user.id);
-            userThreads[user.id] = thread.id;
-            analytics.totalThreads++;
-            analytics.activeThreads++;
-
-            // Case 2: Successfully created a new private thread channel
-            const successEmbed = new EmbedBuilder()
-                .setColor(0x32CD32) // Standard green theme
-                .setAuthor({ name: user.username, iconURL: avatarURL })
-                .setDescription("Private chat created ✅")
-                .setFooter({ text: "ClippingBase AI" })
-                .setTimestamp();
-
-            await interaction.editReply({ embeds: [successEmbed] });
-
-            // Send the welcome payload inside the new thread
-            const welcome = new EmbedBuilder()
-                .setColor(0x32CD32)
-                .setTitle("ClippingBase AI Chat")
-                .setDescription(`Hey ${user.username} 👋\n\nYou're now chatting with ClippingBase AI.`);
-
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId("close_thread")
-                    .setLabel("Close Thread")
-                    .setStyle(ButtonStyle.Danger)
-            );
-
-            await thread.send({ embeds: [welcome], components: [row] });
-            return;
-        }
-
-
-    if (interaction.customId === "close_thread") { 
-    const row = new ActionRowBuilder().addComponents( 
-        new ButtonBuilder().setCustomId("confirm_close_yes").setLabel("Yes, close it").setStyle(ButtonStyle.Danger), 
-        new ButtonBuilder().setCustomId("confirm_close_no").setLabel("Cancel").setStyle(ButtonStyle.Secondary) 
-    ); 
-
-    const avatarURL = interaction.user.displayAvatarURL({ dynamic: true, size: 1024 });
-    const initialConfirmEmbed = new EmbedBuilder()
-        .setColor(0x32CD32)
-        .setAuthor({ name: interaction.user.username, iconURL: avatarURL })
-        .setDescription("⚠️ Are you sure you want to close this thread?")
-        .setFooter({ text: "ClippingBase AI" })
+      const embed = new EmbedBuilder()
+        .setColor(colorOption ? parseInt(colorOption.replace(/^#/, ""), 16) : 0x32CD32)
+        .setTitle(title)
+        .setDescription(description)
         .setTimestamp();
 
-    // FIXED: Uses flags instead of the deprecated ephemeral attribute
-    return interaction.reply({ 
-        content: null, 
-        embeds: [initialConfirmEmbed], 
-        components: [row], 
-        flags: [MessageFlags.Ephemeral] 
-    }); 
-} 
+      if (image) embed.setImage(image);
 
+      const startChatBtn = new ButtonBuilder()
+          .setCustomId('start_chat')
+          .setLabel('Start a Chat 🚀')
+          .setStyle(ButtonStyle.Success);
 
-if (interaction.customId === "confirm_close_no") { 
-    const avatarURL = interaction.user.displayAvatarURL({ dynamic: true, size: 1024 });
-    const cancelEmbed = new EmbedBuilder()
-        .setColor(0x32CD32) // Standard green theme
-        .setAuthor({ name: interaction.user.username, iconURL: avatarURL })
-        .setDescription("❎ Cancelled. Thread will stay open.")
-        .setFooter({ text: "ClippingBase AI" })
-        .setTimestamp();
+      const whatsNewBtn = new ButtonBuilder()
+          .setCustomId('user_view_new_btn')
+          .setLabel("What's New")
+          .setStyle(ButtonStyle.Secondary);
 
-    return interaction.update({ content: null, embeds: [cancelEmbed], components: [] }); 
-} 
+      const row = new ActionRowBuilder().addComponents(startChatBtn, whatsNewBtn);
 
-if (interaction.customId === "confirm_close_yes") { 
-    const row = new ActionRowBuilder().addComponents( 
-        new ButtonBuilder().setCustomId("feedback_yes").setLabel("Yes 👍").setStyle(ButtonStyle.Success), 
-        new ButtonBuilder().setCustomId("feedback_no").setLabel("No 👎").setStyle(ButtonStyle.Danger) 
-    ); 
-
-    const avatarURL = interaction.user.displayAvatarURL({ dynamic: true, size: 1024 });
-    const feedbackEmbed = new EmbedBuilder()
-        .setColor(0x32CD32)
-        .setAuthor({ name: interaction.user.username, iconURL: avatarURL })
-        .setDescription("💬 Did ClippingBase AI solve your problem?")
-        .setFooter({ text: "ClippingBase AI" })
-        .setTimestamp();
-
-    return interaction.update({ content: null, embeds: [feedbackEmbed], components: [row] }); 
-} 
-
-if (interaction.customId === "feedback_yes" || interaction.customId === "feedback_no") { 
-    const channel = interaction.channel; 
-    const isYes = interaction.customId === "feedback_yes";
-
-    // 1. Process Analytics
-    analytics.activeThreads = Math.max(0, analytics.activeThreads - 1); 
-    analytics.closedThreads++; 
-    if (isYes) {
-        analytics.solved++;
-    } else {
-        analytics.unsolved++;
-    }
-
-    // 2. 🛡️ AGGRESSIVE SESSION WIPE (Fixes the duplicate active chat bug)
-    // Gather all possible keys your database might be tracking
-    const keysToClear = new Set();
-    
-    if (interaction.user.id) keysToClear.add(interaction.user.id);
-    if (channel && channel.id) keysToClear.add(channel.id);
-    if (channel && channel.isThread() && channel.ownerId) keysToClear.add(channel.ownerId);
-
-    // Loop through keys and clear conversations/userThreads
-    keysToClear.forEach(key => {
-        if (typeof conversations !== 'undefined' && conversations[key]) delete conversations[key]; 
-        if (typeof userThreads !== 'undefined' && userThreads[key]) delete userThreads[key];
-    });
-
-    // Also scan your userThreads object by value in case the thread ID is saved inside it
-    if (typeof userThreads !== 'undefined' && channel && channel.id) {
-        for (const [uid, tid] of Object.entries(userThreads)) {
-            if (tid === channel.id) {
-                delete userThreads[uid];
-                if (typeof conversations !== 'undefined') delete conversations[uid];
-            }
-        }
-    }
-
-    // 3. Render Visual Embed Frame
-    const avatarURL = interaction.user.displayAvatarURL({ dynamic: true, size: 1024 });
-    const finalEmbed = new EmbedBuilder()
-        .setColor(0x32CD32)
-        .setAuthor({ name: interaction.user.username, iconURL: avatarURL })
-        .setDescription(isYes 
-            ? "✅ Thanks for your feedback! Closing thread..." 
-            : "👍 Got it — we’ll keep improving ClippingBase AI."
-        )
-        .setFooter({ text: "ClippingBase AI" })
-        .setTimestamp();
-
-    return interaction.update({ content: null, embeds: [finalEmbed], components: [] })
-        .then(() => {
-            // Delete channel safely
-            setTimeout(() => channel.delete().catch(() => {}), 2500); 
-        });
-  }
-
-  }
-
-  if (!interaction.isChatInputCommand()) return;
-
-  if (interaction.commandName === "panel") {
-    const title = interaction.options.getString("title");
-    const description = interaction.options.getString("description");
-    const image = interaction.options.getString("image");
-    const colorOption = interaction.options.getString("color");
-
-    const embed = new EmbedBuilder()
-      .setColor(colorOption ? parseInt(colorOption.replace(/^#/, ""), 16) : 0x32CD32)
-      .setTitle(title)
-      .setDescription(description)
-      .setTimestamp();
-
-    if (image) embed.setImage(image);
-
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId("start_chat")
-        .setLabel("Start Chat 🚀")
-        .setStyle(ButtonStyle.Success)
-    );
-
-    return interaction.reply({
-      embeds: [embed],
-      components: [row]
-    });
-  }
-
-  if (interaction.commandName === "analytics") {
-    if (!interaction.member.permissions.has("Administrator")) {
+      // Successfully made public by removing ephemeral flag
       return interaction.reply({
-        content: "❌ Admin only.",
-        ephemeral: true
+        embeds: [embed],
+        components: [row]
       });
     }
 
-    const rate =
-      analytics.closedThreads === 0
-        ? 0
-        : Math.round((analytics.solved / analytics.closedThreads) * 100);
+    if (interaction.commandName === "analytics") {
+      if (!interaction.member.permissions.has("Administrator")) {
+        return interaction.reply({ content: "❌ Admin only.", flags: [MessageFlags.Ephemeral] });
+      }
 
-    const embed = new EmbedBuilder()
-      .setColor(0x32CD32)
-      .setTitle("ClippingBase AI Support Analytics Dashboard")
-      .addFields(
-        { name: " 💬 Messages", value: `${analytics.messages}`, inline: true },
-        { name: " 📊 Total Threads", value: `${analytics.totalThreads}`, inline: true },
-        { name: " 🕒 Active Threads", value: `${analytics.activeThreads}`, inline: true },
-        { name: " 📤 Closed Threads", value: `${analytics.closedThreads}`, inline: true },
-        { name: " ✅ Solved", value: `${analytics.solved}`, inline: true },
-        { name: " ❌ Unsolved", value: `${analytics.unsolved}`, inline: true },
-        { name: " 🎯 Resolution Rate", value: `${rate}%`, inline: true },
-      )
-      .setTimestamp();
+      const rate = analytics.closedThreads === 0 ? 0 : Math.round((analytics.solved / analytics.closedThreads) * 100);
+      const pendingCount = analytics.featureRequests.filter(r => !r.reviewed).length;
 
-    return interaction.reply({
-      embeds: [embed],
-      ephemeral: true
-    });
+      const embed = new EmbedBuilder()
+        .setColor(0x32CD32)
+        .setTitle("ClippingBase AI Support Analytics Dashboard")
+        .setDescription(
+          `### Dashboard\n` +
+          `💬 **Messages:** \`${analytics.messages}\`\n\n` +
+          `📊 **Total Threads:** \`${analytics.totalThreads}\`\n` +
+          `🕒 **Active Threads:** \`${analytics.activeThreads}\`\n` +
+          `📤 **Closed Threads:** \`${analytics.closedThreads}\`\n` +
+          `🤖 **Auto-Closed (Inactivity):** \`${analytics.autoClosedThreads}\`\n` +
+          `✅ **Solved:** \`${analytics.solved}\`\n` +
+          `❌ **Unsolved:** \`${analytics.unsolved}\`\n` +
+          `🎯 **Resolution Rate:** \`${rate}%\`\n` +
+          `🛡️ **Anti-Spam Tripped Blocks:** \`${analytics.spamBlocks}\`\n` +
+          `⏳ **Current Timeout Window:** \`${inactivityTimeoutHours} Hours\`\n\n` + 
+          `### Topic Classification Friction Points\n` +
+          `💰 **Payout Issues:** \`${analytics.categories["Payout Issue"]}\`\n` +
+          `🪲 **Sign-Up Bugs:** \`${analytics.categories["Sign-Up Bug"]}\`\n` +
+          `📣 **Campaign Inquiries:** \`${analytics.categories["Campaign Inquiry"]}\`\n` +
+          `❓ **General Questions:** \`${analytics.categories["General Question"]}\`\n\n` +
+          `### Feature Review Overview\n` +
+          `⏳ **Pending Feature Requests:** \`${pendingCount}\`\n` +
+          `💡 **Total Logged Requests:** \`${analytics.featureRequests.length}\`\n\n` +
+          `### Updates Likes & Dislikes\n` +
+          `👍 \`${analytics.updateLikes}\` ⁞ 👎 \`${analytics.updateDislikes}\``
+        )
+        .setTimestamp();
+
+      const row1 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId("admin_view_pending_features")
+          .setLabel("View Pending Requests ⏳")
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId("admin_view_features")
+          .setLabel("Feature History 💡")
+          .setStyle(ButtonStyle.Secondary)
+      );
+
+      const row2 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId("admin_edit_inactivity_timeout")
+          .setLabel("⚙️ Edit Auto-Close Window")
+          .setStyle(ButtonStyle.Danger)
+      );
+
+      return interaction.reply({ embeds: [embed], components: [row1, row2], flags: [MessageFlags.Ephemeral] });
+    }
+  }
+
+  // Handle Modals Input Submissions
+  if (interaction.isModalSubmit()) {
+    if (interaction.customId === 'feature_request_modal') {
+      const requestText = interaction.fields.getTextInputValue('feature_input');
+      const timeString = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+      analytics.featureRequests.push({
+        id: Date.now().toString() + Math.floor(Math.random() * 100),
+        userId: interaction.user.id,
+        userTag: interaction.user.tag,
+        text: requestText,
+        timestamp: `Today at ${timeString}`,
+        reviewed: false
+      });
+
+      return interaction.reply({
+        content: "✅ Thank you! Your feature request has been recorded for review.",
+        flags: [MessageFlags.Ephemeral]
+      });
+    }
+
+    if (interaction.customId === 'edit_timeout_modal') {
+      const newHoursInput = interaction.fields.getTextInputValue('timeout_input');
+      const parsedHours = parseInt(newHoursInput, 10);
+
+      if (isNaN(parsedHours) || parsedHours <= 0) {
+        return interaction.reply({
+          content: "❌ Invalid submission. Please type a valid positive integer number of hours.", 
+          flags: [MessageFlags.Ephemeral]
+        });
+      }
+
+      inactivityTimeoutHours = parsedHours;
+      
+      return interaction.reply({
+        content: `✅ Success! The automatic chat inactivity closure window has been updated to **${inactivityTimeoutHours} Hours**.`, 
+        flags: [MessageFlags.Ephemeral]
+      });
+    }
+  }
+
+  if (interaction.isButton()) {
+    // 1. Initial Close Confirmation
+    if (interaction.customId === "confirm_close_yes") { 
+      await interaction.deferUpdate();
+      
+      // We show the Category Selection first
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("cat_payout").setLabel("💰 Payout Issues").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("cat_signup").setLabel("🪲 Sign-Up Bugs").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("cat_campaign").setLabel("📣 Campaign Inquiries").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("cat_general").setLabel("❓ General Questions").setStyle(ButtonStyle.Secondary)
+      ); 
+
+      const embed = new EmbedBuilder()
+          .setColor(0x32CD32)
+          .setDescription("⚠️ Are you sure? Please select the topic of your inquiry to finish closing the thread.");
+
+      return interaction.editReply({ embeds: [embed], components: [row] }); 
+    }
+
+    // 2. Category Selection (Directly captures the topic)
+    if (interaction.customId.startsWith("cat_")) {
+        const catMap = {
+            "cat_payout": "Payout Issue",
+            "cat_signup": "Sign-Up Bug",
+            "cat_campaign": "Campaign Inquiry",
+            "cat_general": "General Question"
+        };
+        const selectedCategory = catMap[interaction.customId];
+        analytics.categories[selectedCategory]++;
+
+        const row = new ActionRowBuilder().addComponents( 
+            new ButtonBuilder().setCustomId(`feedback_yes_${interaction.customId}`).setLabel("Yes 👍").setStyle(ButtonStyle.Success), 
+            new ButtonBuilder().setCustomId(`feedback_no_${interaction.customId}`).setLabel("No 👎").setStyle(ButtonStyle.Danger) 
+        ); 
+
+        const embed = new EmbedBuilder()
+            .setColor(0x32CD32)
+            .setDescription(`Topic: **${selectedCategory}**\n\nDid ClippingBase AI solve your problem?`);
+
+        return interaction.update({ embeds: [embed], components: [row] });
+    }
+
+    // 3. Final Feedback & Cleanup
+    if (interaction.customId.startsWith("feedback_yes_") || interaction.customId.startsWith("feedback_no_")) { 
+      await interaction.deferUpdate();
+
+      const isYes = interaction.customId.startsWith("feedback_yes_");
+      const user = interaction.user;
+      const channel = interaction.channel; 
+
+      analytics.activeThreads = Math.max(0, analytics.activeThreads - 1); 
+      analytics.closedThreads++; 
+      isYes ? analytics.solved++ : analytics.unsolved++;
+
+      // Cleanup logic
+      const keysToClear = [user.id, channel?.id];
+      keysToClear.forEach(key => {
+          delete conversations[key]; 
+          delete userThreads[key];
+          delete antiSpamTracker[key]; 
+      });
+      delete threadLastActivity[channel?.id];
+
+      const finalEmbed = new EmbedBuilder()
+          .setColor(0x32CD32)
+          .setDescription(isYes ? "✅ Thanks for your feedback!" : "👍 Got it — we’ll keep improving.");
+
+      await interaction.editReply({ embeds: [finalEmbed], components: [] });
+      setTimeout(() => channel.delete().catch(() => {}), 2500);
+      return;
+    }
+
+    if (interaction.customId === "confirm_close_no") { 
+      const cancelEmbed = new EmbedBuilder()
+          .setColor(0x32CD32) 
+          .setDescription("❎ Cancelled. Thread will stay open.");
+      return interaction.update({ embeds: [cancelEmbed], components: [] }); 
+    }
+    
+    if (interaction.customId === "admin_edit_inactivity_timeout") {
+      if (!interaction.member.permissions.has("Administrator")) {
+        return interaction.reply({ content: "❌ Access Denied.", flags: [MessageFlags.Ephemeral] });
+      }
+
+      const modal = new ModalBuilder()
+        .setCustomId('edit_timeout_modal')
+        .setTitle('Configure Auto-Close Engine');
+
+      const timeoutInput = new TextInputBuilder()
+        .setCustomId('timeout_input')
+        .setLabel("Inactivity Duration Limit (In Hours)") 
+        .setStyle(TextInputStyle.Short)
+        .setPlaceholder("e.g. 5")
+        .setValue(inactivityTimeoutHours.toString())
+        .setRequired(true);
+
+      const actionRow = new ActionRowBuilder().addComponents(timeoutInput);
+      modal.addComponents(actionRow);
+
+      return interaction.showModal(modal);
+    }
+
+    if (interaction.customId === "admin_view_features") {
+      if (!interaction.member.permissions.has("Administrator")) {
+        return interaction.reply({ content: "❌ Access Denied.", flags: [MessageFlags.Ephemeral] });
+      }
+
+      if (analytics.featureRequests.length === 0) {
+        return interaction.reply({ content: "📭 There are currently no feature requests logged.", flags: [MessageFlags.Ephemeral] });
+      }
+
+      const data = createFeatureEmbedAndRow(analytics.featureRequests, 0, 'history');
+      return interaction.reply({ embeds: data.embeds, components: data.components, flags: [MessageFlags.Ephemeral] });
+    }
+
+    if (interaction.customId === "admin_view_pending_features") {
+      if (!interaction.member.permissions.has("Administrator")) {
+        return interaction.reply({ content: "❌ Access Denied.", flags: [MessageFlags.Ephemeral] });
+      }
+
+      const pendings = analytics.featureRequests.filter(r => !r.reviewed);
+
+      if (pendings.length === 0) {
+        return interaction.reply({ content: "🎉 All caught up! No pending feature requests found.", flags: [MessageFlags.Ephemeral] });
+      }
+
+      const data = createFeatureEmbedAndRow(pendings, 0, 'pending');
+      return interaction.reply({ embeds: data.embeds, components: data.components, flags: [MessageFlags.Ephemeral] });
+    }
+
+    if (interaction.customId.startsWith("feat_nav_")) {
+      const parts = interaction.customId.split("_"); 
+      const flowType = parts[2];
+      const direction = parts[3];
+      const oldIndex = parseInt(parts[4], 10);
+      
+      let targetIndex = direction === 'next' ? oldIndex + 1 : oldIndex - 1;
+      const targetDataset = flowType === 'pending' 
+        ? analytics.featureRequests.filter(r => !r.reviewed)
+        : analytics.featureRequests;
+
+      if (targetIndex < 0 || targetIndex >= targetDataset.length) {
+        return interaction.reply({ content: "⚠️ Page bounds anomaly detected.", flags: [MessageFlags.Ephemeral] });
+      }
+
+      const updatedView = createFeatureEmbedAndRow(targetDataset, targetIndex, flowType);
+      return interaction.update({ embeds: updatedView.embeds, components: updatedView.components });
+    }
+
+    if (interaction.customId.startsWith("review_mark_")) {
+      if (!interaction.member.permissions.has("Administrator")) {
+        return interaction.reply({ content: "❌ Access Denied.", flags: [MessageFlags.Ephemeral] });
+      }
+
+      const parts = interaction.customId.split("_"); 
+      const targetId = parts[2];
+      const flowType = parts[3];
+      const currentViewIndex = parseInt(parts[4], 10);
+
+      const index = analytics.featureRequests.findIndex(r => r.id === targetId);
+      if (index !== -1) {
+        analytics.featureRequests[index].reviewed = true;
+      }
+
+      const remainingDataset = flowType === 'pending'
+        ? analytics.featureRequests.filter(r => !r.reviewed)
+        : analytics.featureRequests;
+
+      if (remainingDataset.length === 0) {
+        return interaction.update({
+          content: "Base updated natively outside an embed structure context. ✅ Request verified!",
+          embeds: [],
+          components: []
+        });
+      }
+
+      let targetIndex = currentViewIndex;
+      if (targetIndex >= remainingDataset.length) {
+        targetIndex = remainingDataset.length - 1;
+      }
+
+      const nextView = createFeatureEmbedAndRow(remainingDataset, targetIndex, flowType);
+      return interaction.update({ embeds: nextView.embeds, components: nextView.components });
+    }
+
+    if (interaction.customId === "start_chat") {
+      await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+      const user = interaction.user;
+      const avatarURL = user.displayAvatarURL({ dynamic: true, size: 1024 });
+
+      if (userThreads[user.id]) {
+        const duplicateEmbed = new EmbedBuilder()
+            .setColor(0xFF0000) 
+            .setAuthor({ name: user.username, iconURL: avatarURL })
+            .setDescription("❌ You already have an active chat.")
+            .setFooter({ text: "ClippingBase AI" })
+            .setTimestamp();
+
+        return interaction.editReply({ embeds: [duplicateEmbed] });
+      }
+
+      const thread = await interaction.channel.threads.create({ 
+          name: `${user.username}-chat`, 
+          type: ChannelType.PrivateThread, 
+          autoArchiveDuration: 60 
+      });
+      
+      await thread.members.add(user.id);
+      userThreads[user.id] = thread.id;
+      threadLastActivity[thread.id] = Date.now(); 
+      analytics.totalThreads++;
+      analytics.activeThreads++;
+
+      try {
+          const logChannel = await client.channels.fetch(LOG_CHANNEL_ID);
+          if (logChannel) {
+              const logEmbed = new EmbedBuilder()
+                  .setColor('#00FF00')
+                  .setAuthor({ name: user.username, iconURL: avatarURL })
+                  .setTitle('New Private Chat Created')
+                  .addFields(
+                      { name: 'User', value: `<@${user.id}>`, inline: true },
+                      { name: 'Thread', value: `<#${thread.id}>`, inline: true }
+                  )
+                  .setFooter({ 
+                      text: "ClippingBase AI Detection System", 
+                      iconURL: client.user.displayAvatarURL() 
+                  })
+                  .setTimestamp();
+
+              await logChannel.send({ embeds: [logEmbed] });
+          }
+      } catch (error) {
+          console.error("Could not send log to channel:", error);
+      }
+
+      const successEmbed = new EmbedBuilder()
+          .setColor(0x32CD32) 
+          .setAuthor({ name: user.username, iconURL: avatarURL })
+          .setDescription("Private chat created ✅")
+          .setFooter({ text: "ClippingBase AI" })
+          .setTimestamp();
+
+      await interaction.editReply({ embeds: [successEmbed] });
+
+      const welcome = new EmbedBuilder()
+          .setColor(0x32CD32)
+          .setTitle("ClippingBase AI Chat")
+          .setDescription(`Hey ${user.username} 👋\n\nYou're now chatting with ClippingBase AI.`);
+
+      const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+              .setCustomId("close_thread")
+              .setLabel("Close Thread")
+              .setStyle(ButtonStyle.Danger)
+      );
+
+      await thread.send({ embeds: [welcome], components: [row] });
+      return;
+    }
+
+    if (interaction.customId === 'user_view_new_btn') {
+      const avatarURL = interaction.user.displayAvatarURL({ dynamic: true, size: 1024 });
+      
+      const updateEmbed = new EmbedBuilder()
+          .setColor(0x32CD32) 
+          .setAuthor({ name: "ClippingBase AI", iconURL: client.user.displayAvatarURL() })
+          .setTitle("What's New on ClippingBase ✨")
+          .setDescription(whatsNewText) 
+          .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: avatarURL })
+          .setTimestamp();
+
+      const rateBtn = new ButtonBuilder()
+          .setCustomId('rate_update_trigger')
+          .setLabel('Rate This Update ⭐')
+          .setStyle(ButtonStyle.Primary);
+
+      const featureBtn = new ButtonBuilder()
+          .setCustomId('request_feature_trigger')
+          .setLabel('Request a Feature 💡')
+          .setStyle(ButtonStyle.Success);
+
+      const row = new ActionRowBuilder().addComponents(rateBtn, featureBtn);
+
+      return interaction.reply({ 
+          embeds: [updateEmbed], 
+          components: [row],
+          flags: [MessageFlags.Ephemeral] 
+      });
+    }
+
+    if (interaction.customId === 'rate_update_trigger') {
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('vote_update_like').setLabel('Like 👍').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId('vote_update_dislike').setLabel('Dislike 👎').setStyle(ButtonStyle.Danger)
+      );
+
+      return interaction.update({ components: [row] });
+    }
+
+    if (interaction.customId === 'vote_update_like' || interaction.customId === 'vote_update_dislike') {
+      if (interaction.customId === 'vote_update_like') {
+        analytics.updateLikes++;
+      } else {
+        analytics.updateDislikes++;
+      }
+
+      return interaction.update({
+        content: "✅ Thanks for letting us know your thoughts!",
+        embeds: [],
+        components: []
+      });
+    }
+
+    if (interaction.customId === 'request_feature_trigger') {
+      const modal = new ModalBuilder()
+        .setCustomId('feature_request_modal')
+        .setTitle('Request a Feature');
+
+      const featureInput = new TextInputBuilder()
+        .setCustomId('feature_input')
+        .setLabel("What feature would you like to see?")
+        .setStyle(TextInputStyle.Paragraph)
+        .setPlaceholder("Type your feature request here...")
+        .setMaxLength(100)
+        .setRequired(true);
+
+      const actionRow = new ActionRowBuilder().addComponents(featureInput);
+      modal.addComponents(actionRow);
+
+      return interaction.showModal(modal);
+    }
+
+    if (interaction.customId === "close_thread") { 
+      const row = new ActionRowBuilder().addComponents( 
+          new ButtonBuilder().setCustomId("confirm_close_yes").setLabel("Yes, close it").setStyle(ButtonStyle.Danger), 
+          new ButtonBuilder().setCustomId("confirm_close_no").setLabel("Cancel").setStyle(ButtonStyle.Secondary) 
+      ); 
+
+      const avatarURL = interaction.user.displayAvatarURL({ dynamic: true, size: 1024 });
+      const initialConfirmEmbed = new EmbedBuilder()
+          .setColor(0x32CD32)
+          .setAuthor({ name: interaction.user.username, iconURL: avatarURL })
+          .setDescription("⚠️ Are you sure you want to close this thread?")
+          .setFooter({ text: "ClippingBase AI" })
+          .setTimestamp();
+
+      return interaction.reply({ 
+          embeds: [initialConfirmEmbed], 
+          components: [row], 
+          flags: [MessageFlags.Ephemeral] 
+      }); 
+    } 
   }
 });
 
-// Log in the Discord client
+// =========================
+// LOGIN
+// =========================
 client.login(process.env.DISCORD_TOKEN);
