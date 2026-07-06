@@ -79,10 +79,11 @@ const analytics = {
   
   // Track metrics for micro-scale friction points
   categories: {
-    "Payout Issue": 0,
-    "Sign-Up Bug": 0,
-    "Campaign Inquiry": 0,
-    "General Question": 0
+    "💸 Payments": 0,
+    "👥 Sign-Up Bug": 0,
+    "📢 Campaign Inquiry": 0,
+    "❓ General Question": 0,
+  
   }
 };
 
