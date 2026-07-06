@@ -82,10 +82,60 @@ const analytics = {
     "Payout Issue": 0,
     "Sign-Up Bug": 0,
     "Campaign Inquiry": 0,
-    "General Question": 0,
-    "Unclassified/Error": 0
+    "General Question": 0
   }
 };
+
+function slugifyTopicName(topicName) {
+  return topicName
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
+function getTopicLabelFromCustomId(customId) {
+  const slug = customId.replace(/^feedback_(yes|no)_/, '').replace(/^cat_/, '');
+  return Object.entries(analytics.categories).find(([topicName]) => slugifyTopicName(topicName) === slug)?.[0] || null;
+}
+
+function addTopicClassification(topicName) {
+  const cleanName = topicName.trim();
+
+  if (!cleanName) {
+    return { ok: false, message: '❌ Topic title cannot be empty.' };
+  }
+
+  if (analytics.categories[cleanName] !== undefined) {
+    return { ok: false, message: `❌ "${cleanName}" already exists.` };
+  }
+
+  analytics.categories[cleanName] = 0;
+  return { ok: true, message: `✅ Added "${cleanName}" to the thread closing topics.` };
+}
+
+function buildTopicSelectionRows() {
+  const topicNames = Object.keys(analytics.categories);
+  const rows = [];
+
+  for (let i = 0; i < topicNames.length; i += 5) {
+    const chunk = topicNames.slice(i, i + 5);
+    const row = new ActionRowBuilder();
+
+    chunk.forEach((topicName) => {
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`cat_${slugifyTopicName(topicName)}`)
+          .setLabel(topicName)
+          .setStyle(ButtonStyle.Secondary)
+      );
+    });
+
+    rows.push(row);
+  }
+
+  return rows;
+}
 
 // Helper pagination generator for Feature Request flows
 function createFeatureEmbedAndRow(requestsList, currentIndex, flowType) {
@@ -350,58 +400,6 @@ ONLY USE THIS DATA.
 ∘ keep response short and useful
 
 ━━━━━━━━━━━━━━━━━━━
-
-When a user asks **"What's new?"**, **"Any new features?"**, **"What's changed?"**, or a similar question **without specifying what they're referring to**, first ask a clarification question instead of assuming.
-
-Example:
-
-> **Could you please specify what you're referring to? Are you asking about ClippingBase AI updates, ClippingBase platform updates, or something else?**
-
-Once the user confirms they're asking about **ClippingBase AI**, respond with a short summary of the latest updates.
-
-**Latest Features (Version 1.1):**
-
-* 🧠 **AI Thread Summaries:** Automatically summarizes the user's first message and renames the support thread.
-* 💡 **Feature Requests:** Users can now submit feature requests directly through the AI.
-* ⭐ **Update Reactions:** Users can Like or Dislike update logs to share feedback.
-* 🕒 **Automatic Thread Closing:** Inactive support threads are automatically closed after being idle.
-* ⚡ **Faster & Smarter AI:** Improved response speed, better understanding, and higher-quality answers.
-
-If the user asks **how to submit a feature request**, explain just like this:
-
-* Go to **<#1511543190803447858>**.
-* Open the **ClippingBase AI** panel.
-* Click **What's New** (next to **Start a Chat**).
-* Scroll to the bottom and click **Request a Feature**.
-* Fill out the popup form and submit it. Our team will review your suggestion for a future update.
-
-If the user asks **how to rate an update or anything like that**, explain:
-
-* Open **What's New** from the ClippingBase AI panel.
-* Scroll to the bottom.
-* Click **Rate this Update**.
-* Choose **👍 Like** or **👎 Dislike** to submit your feedback.
-
-Always keep responses friendly, concise, and never mention features that do not exist.
-
-If the user asks **how to start a chat or anything like that**, explain just like this:
-
-### **How to Start a Chat**
-
-1. Go to **<#1511543190803447858>**.
-2. Locate the **ClippingBase AI** panel.
-3. Click the **Start a Chat** button.
-4. A new private support thread will be created for you automatically.
-5. Send your first message describing your question, issue, or request.
-6. ClippingBase AI will respond, and your thread will automatically be renamed based on your first message to keep it organized.
-
-If the user already has an open thread, let them know they should continue using that thread instead of creating a new one unless it has been closed.
-
-Keep the response friendly, and easy to follow.
-
-
-━━━━━━━━━━━━━━━━━━━
-
 🧠 CLIPPINGBASE MASTER SYSTEM MAP
 [...]
 `;
@@ -762,6 +760,10 @@ client.on('interactionCreate', async (interaction) => {
       const rate = analytics.closedThreads === 0 ? 0 : Math.round((analytics.solved / analytics.closedThreads) * 100);
       const pendingCount = analytics.featureRequests.filter(r => !r.reviewed).length;
 
+      const topicLines = Object.entries(analytics.categories)
+        .map(([topicName, count]) => `• **${topicName}:** \`${count}\``)
+        .join('\n');
+
       const embed = new EmbedBuilder()
         .setColor(0x32CD32)
         .setTitle("ClippingBase AI Support Analytics Dashboard")
@@ -778,10 +780,7 @@ client.on('interactionCreate', async (interaction) => {
           `🛡️ **Anti-Spam Tripped Blocks:** \`${analytics.spamBlocks}\`\n` +
           `⏳ **Current Timeout Window:** \`${inactivityTimeoutHours} Hours\`\n\n` + 
           `### Topic Classification Friction Points\n` +
-          `💰 **Payout Issues:** \`${analytics.categories["Payout Issue"]}\`\n` +
-          `🪲 **Sign-Up Bugs:** \`${analytics.categories["Sign-Up Bug"]}\`\n` +
-          `📣 **Campaign Inquiries:** \`${analytics.categories["Campaign Inquiry"]}\`\n` +
-          `❓ **General Questions:** \`${analytics.categories["General Question"]}\`\n\n` +
+          `${topicLines || '• No topics added yet.'}\n\n` +
           `### Feature Review Overview\n` +
           `⏳ **Pending Feature Requests:** \`${pendingCount}\`\n` +
           `💡 **Total Logged Requests:** \`${analytics.featureRequests.length}\`\n\n` +
@@ -802,6 +801,10 @@ client.on('interactionCreate', async (interaction) => {
       );
 
       const row2 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId("admin_add_topic_classification")
+          .setLabel("➕ Add Topic")
+          .setStyle(ButtonStyle.Primary),
         new ButtonBuilder()
           .setCustomId("admin_edit_inactivity_timeout")
           .setLabel("⚙️ Edit Auto-Close Window")
@@ -851,6 +854,16 @@ client.on('interactionCreate', async (interaction) => {
         flags: [MessageFlags.Ephemeral]
       });
     }
+
+    if (interaction.customId === 'add_topic_modal') {
+      const topicName = interaction.fields.getTextInputValue('topic_name');
+      const result = addTopicClassification(topicName);
+
+      return interaction.reply({
+        content: result.message,
+        flags: [MessageFlags.Ephemeral]
+      });
+    }
   }
 
   if (interaction.isButton()) {
@@ -858,30 +871,22 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.customId === "confirm_close_yes") { 
       await interaction.deferUpdate();
       
-      // We show the Category Selection first
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("cat_payout").setLabel("💰 Payout Issues").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId("cat_signup").setLabel("🪲 Sign-Up Bugs").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId("cat_campaign").setLabel("📣 Campaign Inquiries").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId("cat_general").setLabel("❓ General Questions").setStyle(ButtonStyle.Secondary)
-      ); 
-
+      const topicRows = buildTopicSelectionRows();
       const embed = new EmbedBuilder()
           .setColor(0x32CD32)
           .setDescription("⚠️ Are you sure? Please select the topic of your inquiry to finish closing the thread.");
 
-      return interaction.editReply({ embeds: [embed], components: [row] }); 
+      return interaction.editReply({ embeds: [embed], components: topicRows }); 
     }
 
     // 2. Category Selection (Directly captures the topic)
     if (interaction.customId.startsWith("cat_")) {
-        const catMap = {
-            "cat_payout": "Payout Issue",
-            "cat_signup": "Sign-Up Bug",
-            "cat_campaign": "Campaign Inquiry",
-            "cat_general": "General Question"
-        };
-        const selectedCategory = catMap[interaction.customId];
+        const selectedCategory = getTopicLabelFromCustomId(interaction.customId);
+
+        if (!selectedCategory) {
+          return interaction.reply({ content: "⚠️ This topic is no longer available.", flags: [MessageFlags.Ephemeral] });
+        }
+
         analytics.categories[selectedCategory]++;
 
         const row = new ActionRowBuilder().addComponents( 
@@ -903,10 +908,35 @@ client.on('interactionCreate', async (interaction) => {
       const isYes = interaction.customId.startsWith("feedback_yes_");
       const user = interaction.user;
       const channel = interaction.channel; 
+      const selectedCategory = getTopicLabelFromCustomId(interaction.customId) || 'Unknown Topic';
 
       analytics.activeThreads = Math.max(0, analytics.activeThreads - 1); 
       analytics.closedThreads++; 
       isYes ? analytics.solved++ : analytics.unsolved++;
+
+      try {
+        const logChannel = await client.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
+        if (logChannel) {
+          const closeEmbed = new EmbedBuilder()
+            .setColor(isYes ? 0x32CD32 : 0xFF0000)
+            .setTitle('✅ Private Chat Closed')
+            .addFields(
+              { name: 'User', value: `<@${user.id}>`, inline: true },
+              { name: 'Topic', value: `**${selectedCategory}**`, inline: true },
+              { name: 'Resolved', value: `**${isYes ? 'Yes' : 'No'}**`, inline: true },
+              { name: 'Thread', value: `<#${channel?.id || 'unknown'}>`, inline: true }
+            )
+            .setFooter({
+              text: 'ClippingBase AI Detection System',
+              iconURL: client.user.displayAvatarURL()
+            })
+            .setTimestamp();
+
+          await logChannel.send({ embeds: [closeEmbed] });
+        }
+      } catch (logErr) {
+        console.error('Could not send private chat close log:', logErr);
+      }
 
       // Cleanup logic
       const keysToClear = [user.id, channel?.id];
@@ -919,7 +949,7 @@ client.on('interactionCreate', async (interaction) => {
 
       const finalEmbed = new EmbedBuilder()
           .setColor(0x32CD32)
-          .setDescription(isYes ? "✅ Thanks for your feedback!" : "👍 Got it — we’ll keep improving.");
+          .setDescription(isYes ? "✅ Thanks for your feedback!" : "👍 Got it — we’ll keep improving ClippingBase AI.");
 
       await interaction.editReply({ embeds: [finalEmbed], components: [] });
       setTimeout(() => channel.delete().catch(() => {}), 2500);
@@ -933,6 +963,28 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.update({ embeds: [cancelEmbed], components: [] }); 
     }
     
+    if (interaction.customId === "admin_add_topic_classification") {
+      if (!interaction.member.permissions.has("Administrator")) {
+        return interaction.reply({ content: "❌ Access Denied.", flags: [MessageFlags.Ephemeral] });
+      }
+
+      const modal = new ModalBuilder()
+        .setCustomId('add_topic_modal')
+        .setTitle('Add New Closing Topic');
+
+      const topicInput = new TextInputBuilder()
+        .setCustomId('topic_name')
+        .setLabel("Topic Title")
+        .setStyle(TextInputStyle.Short)
+        .setPlaceholder("e.g. Billing Issue")
+        .setRequired(true);
+
+      const actionRow = new ActionRowBuilder().addComponents(topicInput);
+      modal.addComponents(actionRow);
+
+      return interaction.showModal(modal);
+    }
+
     if (interaction.customId === "admin_edit_inactivity_timeout") {
       if (!interaction.member.permissions.has("Administrator")) {
         return interaction.reply({ content: "❌ Access Denied.", flags: [MessageFlags.Ephemeral] });
