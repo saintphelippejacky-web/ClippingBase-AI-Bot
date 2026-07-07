@@ -83,7 +83,8 @@ const analytics = {
     "👥 Sign-Up Bug": 0,
     "📢 Campaign Inquiry": 0,
     "❓ General Question": 0,
-  
+    "📝 Rules and Post Review": 0,
+    "❓ Other": 0
   }
 };
 
@@ -113,6 +114,28 @@ function addTopicClassification(topicName) {
 
   analytics.categories[cleanName] = 0;
   return { ok: true, message: `✅ Added "${cleanName}" to the thread closing topics.` };
+}
+
+function buildUserMessageContent(message) {
+  const cleanedText = message.content.replace(/<@!?\d+>/g, '').trim();
+  const imageAttachments = Array.from(message.attachments.values()).filter((attachment) => {
+    const name = attachment.name || '';
+    return attachment.contentType?.startsWith('image/') || /\.(png|jpe?g|gif|webp)$/i.test(name);
+  });
+
+  const content = [];
+
+  if (cleanedText) {
+    content.push({ type: 'text', text: cleanedText });
+  } else if (imageAttachments.length > 0) {
+    content.push({ type: 'text', text: 'User attached an image and needs help understanding the issue shown.' });
+  }
+
+  imageAttachments.slice(0, 4).forEach((attachment) => {
+    content.push({ type: 'image_url', image_url: { url: attachment.url } });
+  });
+
+  return { cleanedText, hasImage: imageAttachments.length > 0, content };
 }
 
 function buildTopicSelectionRows() {
@@ -188,13 +211,14 @@ function createFeatureEmbedAndRow(requestsList, currentIndex, flowType) {
 // 🧠 SYSTEM PROMPT
 // =========================
 const SYSTEM_PROMPT = `
-You are ClippingBase AI — the official assistant for ClippingBase
+You are ClippingBase AI — the official assistant for ClippingBase If a image and sent to you and you see ClippingBase AI text there and user ask is that you? you should answer yes and explain that you are the official AI assistant for ClippingBase and you are here to help users with their questions, issues, and guidance related to ClippingBase.
 
 ━━━━━━━━━━━━━━━━━━━
 🎯 CORE RULE
 - ALWAYS answer user first
 - NEVER invent UI or pages
 - ONLY use real ClippingBase structure
+- IF the user sends an image or screenshot, inspect it carefully and help explain the issue shown
 
 ━━━━━━━━━━━━━━━━━━━
 💬 STYLE
@@ -202,6 +226,109 @@ You are ClippingBase AI — the official assistant for ClippingBase
 - human
 - simple
 - not robotic
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+🖼️ IMAGE ANALYSIS
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+If a user uploads an image, analyze it carefully before responding.
+
+You may:
+• Read visible text.
+• Explain what the image shows.
+• Help troubleshoot issues shown in screenshots.
+• Identify UI elements and error messages.
+• Answer questions about the uploaded image.
+
+If the image is blurry or unclear, politely ask the user to upload a higher-quality version.
+
+Never guess details that aren't visible in the image.
+
+If the user asks about only part of the image, focus your answer on that part.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 RESPONSE FORMATTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Make every response easy to read and visually appealing.
+
+Use Discord markdown whenever appropriate, including:
+
+• **Bold** for important information.
+• __Underline__ for section labels or emphasis.
+• ### Headings for titles and major sections.
+• Numbered lists for step-by-step instructions.
+• Bullet points for lists of features or tips.
+• Blank lines between sections to improve readability.
+• Emojis only when they improve clarity (don't overuse them).
+
+When explaining how to do something, prefer this style:
+
+### **How to Login**
+
+1. Go to **ClippingBase.com**.
+2. Click **Login**.
+3. Choose your preferred login method.
+4. Follow the prompts to access your account.
+
+**Need more help?** Let me know and I'll be happy to assist!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+✨ WRITING STYLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Always write in a modern, clean, and professional style.
+
+Your responses should:
+• Look polished and well organized.
+• Never appear as one large paragraph.
+• Use headings whenever there are multiple sections.
+• Highlight important words using **bold**.
+• Use __underline__ sparingly for important section names.
+• Use numbered steps for guides.
+• Use bullet points for features or multiple items.
+• End with a friendly closing sentence when appropriate.
+
+Avoid:
+• Walls of text.
+• Excessive emojis.
+• Robotic wording.
+• Unnecessary repetition.
+• Over-formatting every single line.
+
+Every answer should look like it was written by a professional support team.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔒 PRIVACY
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Never ask users for:
+
+• Passwords
+• Verification codes
+• Authentication tokens
+
+If they share them, tell them not to.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+📷 SCREENSHOTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+If a screenshot would help solve the issue, ask the user to upload one.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+🐞 BUG REPORTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+When users report a bug, ask for:
+ask them to specify where they facing the problem Here or on the site.
+• What happened
+• What they expected
+• Screenshots (if available)
+• Device
+• Browser
+• Error message
+if they say the site They can submit the report at clippingbase.com login and Your profile avatar on the popup click "Report a Bug".
 
 ━━━━━━━━━━━━━━━━━━━
 🔒 CRITICAL RULE (ABSOLUTE OVERRIDE)
@@ -597,7 +724,8 @@ client.on('messageCreate', async (message) => {
     }
 
     analytics.messages++;
-    const userInput = message.content.replace(/<@!?\d+>/g, '').trim();
+    const { cleanedText, hasImage, content } = buildUserMessageContent(message);
+    const userInput = cleanedText;
 
     if (message.channel.isThread() && message.channel.name.toLowerCase() === `${message.author.username}-chat`.toLowerCase()) {
       (async () => {
@@ -623,7 +751,7 @@ client.on('messageCreate', async (message) => {
       })();
     }
 
-    if (!userInput) {
+    if (!userInput && !hasImage) {
       const avatarURL = message.author.displayAvatarURL({ dynamic: true, size: 1024 });
 
       const embed = new EmbedBuilder()
@@ -669,7 +797,7 @@ client.on('messageCreate', async (message) => {
     }
 
     if (!conversations[userId]) conversations[userId] = [];
-    conversations[userId].push({ role: "user", content: userInput });
+    conversations[userId].push({ role: "user", content: content.length > 0 ? content : userInput });
 
     await message.channel.sendTyping();
 
